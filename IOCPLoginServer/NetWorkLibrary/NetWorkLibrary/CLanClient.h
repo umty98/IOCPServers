@@ -1,0 +1,231 @@
+#pragma once
+
+extern DWORD isClientConnected;
+extern DWORD maxClient;
+
+class CLanClient
+{
+public:
+#pragma pack(push, 1)
+    struct NetWorkHeader
+    {
+        BYTE code;
+        WORD len;
+        BYTE randkey;
+        BYTE checkSum;
+    };
+#pragma pack(pop)
+    typedef union
+    {
+        LONG64 whole;
+        struct
+        {
+            LONG Flag;
+            LONG Count;
+        }parts;
+    } U;
+
+    struct alignas(64) SESSION
+    {
+        //CRITICAL_SECTION cs;
+        SOCKET sock;
+        //RingBuffer recvQ;
+        //RingBuffer sendQ;
+        OVERLAPPED recvOverlapped;
+        OVERLAPPED sendOverlapped;
+        PacketBufferReader* curReaderBuf;
+        LockFreeQueue<PacketBuffer*> sendQueue;
+        uint64_t sessionID; // 64비트: 상위 16비트는 vector 인덱스, 하위 48비트는 고유 unique session id
+        //LONG ioCount;
+        LONG isSending;
+        LONG sendCnt;
+        bool toDelete;
+        bool isActive;
+        DWORD port;
+        std::string ip;
+        LONG stopIO;
+        U ioState;
+        U sendState;
+
+        SESSION()
+            : sock(INVALID_SOCKET),
+            sessionID(0), isSending(0), toDelete(true), port(0), ip(""), sendCnt(0), isActive(false), stopIO(0)
+        {
+            ZeroMemory(&recvOverlapped, sizeof(OVERLAPPED));
+            ZeroMemory(&sendOverlapped, sizeof(OVERLAPPED));
+            sendState.whole = 0;
+            // ioState.whole = 0;
+            // ioState.parts.Flag = 1;
+             //시작시 ioFlag 켜져있고
+            ioState.parts.Flag = 1;
+            ioState.parts.Count = 0;
+            curReaderBuf = PacketBufferReader::Alloc();
+            // printf("session 생성자호출\n");
+        }
+        ~SESSION()
+        {
+            //printf("session 소멸자호출\n");
+        }
+
+        void Init()
+        {
+            //활성화시 ioFlag 0으로 세팅
+            isActive = true;
+            InterlockedIncrement(&ioState.parts.Count);
+            ioState.parts.Flag = 0;
+            toDelete = false;
+            InterlockedExchange(&stopIO, 0);
+        }
+
+        void Clear()
+        {
+            ZeroMemory(&recvOverlapped, sizeof(OVERLAPPED));
+            ZeroMemory(&sendOverlapped, sizeof(OVERLAPPED));
+            sock = INVALID_SOCKET;
+            //recvQ.ClearBuffer();
+            sessionID = 0;
+            port = 0;
+            ip = "";
+            sendCnt = 0;
+            isActive = false;
+            toDelete = true;
+            sendState.whole = 0;
+            //ioState.whole = 0;
+            //ioState.parts.Flag = 0;
+            //printf("clear ioState %d : %d\n", ioState.parts.Count, ioState.parts.Flag);
+            isSending = 0;
+
+            //기존 recvBuf 새걸로 교체
+            curReaderBuf->Clear();
+            //PacketBuffer* newRecvBuf = PacketBuffer::Alloc();
+            //curRecvBuf->Release();
+            //curRecvBuf = newRecvBuf;
+        }
+    };
+
+public:
+    bool Connect(const char* ip, int port, int workerThreadCount, int conCurrentThreadCount, int maxConnections, int maxPlayers, bool useNagle);
+    void Stop();
+    bool Disconnect(uint64_t sessionID);
+    bool SendPacket(uint64_t sessionID, PacketBuffer* packet);
+
+    void SendAllPacket();
+    void PostSendAll();
+
+    virtual ~CLanClient();
+
+    inline PacketBuffer* CreatePacketBuffer()
+    {
+        //int hdr = GetHeaderSize();
+        return PacketBuffer::Alloc(sizeof(NetWorkHeader));
+    }
+protected:
+    CLanClient();
+
+    virtual void OnEnterJoinServer(uint64_t sessionID) = 0;
+    virtual void OnLeaveServer(uint64_t sessionID) = 0;
+    virtual void OnRecv(uint64_t sessionID, PacketBuffer* packet) = 0;
+
+    int m_maxPlayers;
+    DWORD currentPlayerCnt;
+private:
+    struct WorkerParam
+    {
+        CLanClient* client;
+        int idx;
+    };
+
+    // sessionID 생성 및 인덱스 추출 관련 inline 함수
+    inline uint64_t MakeSessionID(uint16_t index)
+    {
+        // vector 인덱스(index)를 상위 16비트에, m_uniqueIdCounter의 하위 48비트 값을 하위 48비트에 결합합니다.
+        // m_uniqueIdCounter++로 현재 값을 사용한 후 증가시키며, 0xFFFFFFFFFFFFULL 마스크를 통해 하위 48비트만 사용합니다.
+        return (((uint64_t)index << 48) | (m_uniqueIdCounter++ & 0xFFFFFFFFFFFFULL));
+    }
+    inline uint16_t GetSessionIndex(uint64_t sessionID)
+    {
+        // sessionID의 상위 16비트가 vector 인덱스이므로, 오른쪽 48비트 시프트 후 16비트로 변환합니다.
+        return static_cast<uint16_t>(sessionID >> 48);
+    }
+
+    void ReleaseSession(SESSION* session);
+    bool PostRecv(SESSION* session);
+    bool PostSend(SESSION* session);
+    void DisconnectSession(SESSION* session);
+
+    static unsigned __stdcall WorkerThread(LPVOID param);
+
+private:
+    // freeIndices(stack)를 보호하기 위한 크리티컬 섹션 (push/pop 시 사용)
+    CRITICAL_SECTION m_stackCS;
+    // 사용 가능한 vector 인덱스 관리 (push/pop 시 m_stackCS 사용)
+    std::stack<uint16_t> m_freeIndices;
+
+    // LockFreeStack<int> m_freeIndices; // Lock-free stack for free indices
+
+     // 고정 크기 vector: 각 인덱스에 SESSION 포인터를 저장 (읽기는 락 없이 수행)
+    std::vector<SESSION*> m_sessions;
+    //Param 보관용
+    std::vector<WorkerParam*> m_workerParams;
+    //Tps용
+
+    uint64_t m_uniqueIdCounter;  // 하위 48비트용 고유 session id 카운터
+    int m_maxConnections;
+
+    HANDLE m_iocpHandle;
+    HANDLE* m_workerThreads;
+    int m_workerThreadCount;
+
+    // 시작 IP/port (AcceptThread에서 사용)
+    char m_startIP[64];
+    int m_startPort;
+};
+
+
+///////////////////////////////////////
+
+void SetClient();
+
+struct st_Client
+{
+    uint64_t sessionID;
+    bool isActive;
+
+    st_Client()
+        :sessionID(0), isActive(false)
+    {
+
+    }
+};
+
+extern std::vector<st_Client*> clientMap;
+
+inline uint16_t GetClientIndex(uint64_t sessionID)
+{
+    // sessionID의 상위 16비트가 vector 인덱스이므로, 오른쪽 48비트 시프트 후 16비트로 변환합니다.
+    return static_cast<uint16_t>(sessionID >> 48);
+}
+
+static constexpr uint64_t CLIENT_ID_MASK = (1ULL << 48) - 1;
+
+inline uint64_t GetClientID(uint64_t sessionID)
+{
+    return sessionID & CLIENT_ID_MASK;
+}
+
+class MyLanClient : public CLanClient
+{
+public:
+    MyLanClient() {}
+    virtual ~MyLanClient() {}
+
+public:
+    virtual void OnEnterJoinServer(uint64_t sessionID) override;
+    virtual void OnLeaveServer(uint64_t sessionID) override;
+    virtual void OnRecv(uint64_t sessionID, PacketBuffer* packet) override;
+};
+
+void Lan_SendPacket_Unicast(uint64_t sessionID, PacketBuffer* packet);
+
+extern MyLanClient client;
+

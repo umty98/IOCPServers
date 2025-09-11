@@ -1,0 +1,7 @@
+	IP = "127.0.0.1";
+	Port = 10002;
+	workerThreadCount = 1;
+	conCurrentThreadCount = 1;
+	maxConnections = 1;
+	maxPlayers = 1;
+	useNagle = 1;
